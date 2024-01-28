@@ -13,14 +13,19 @@ use tokio::sync::{
     mpsc::{self, Sender},
     oneshot,
 };
+use tokio::time::Instant;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::registry().with(
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "debug".into()),
-    );
-
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "gcounter=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
     let mut handler = CountHandler::new(3);
     let tx = handler.sender();
 
@@ -46,23 +51,15 @@ async fn root() -> &'static str {
     "Hello, World!"
 }
 
-async fn increment(State(state): State<IncrementState>) -> (StatusCode, Json<Response>) {
+async fn increment(State(state): State<IncrementState>) -> StatusCode {
+    let start = Instant::now();
     let result = state.tx.send(CountOperation::Increment).await;
+    tracing::debug!("Elapsed: {}", start.elapsed().as_nanos());
     match result {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(Response {
-                message: "incremented",
-            }),
-        ),
+        Ok(_) => StatusCode::OK,
         Err(e) => {
             tracing::error!("Could not increment: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Response {
-                    message: "Failed to increment",
-                }),
-            )
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -99,7 +96,6 @@ struct IncrementState {
 struct CountHandler {
     tx: mpsc::Sender<CountOperation>,
     rx: mpsc::Receiver<CountOperation>,
-    current: usize,
     count: usize,
     workers: usize,
     senders: Vec<mpsc::Sender<WorkerOperation>>,
@@ -110,7 +106,6 @@ impl CountHandler {
         let (tx, rx) = mpsc::channel(512);
         Self {
             count: 0,
-            current: 0,
             tx,
             rx,
             workers,
@@ -152,9 +147,8 @@ impl CountHandler {
     }
 
     fn get_sender(&mut self) -> Sender<WorkerOperation> {
-        tracing::debug!("Sending to worker {}", self.current);
-        let sender = self.senders[self.current].clone();
-        self.current = (self.current + 1) % self.workers;
+        let index = fastrand::usize(0..self.senders.len());
+        let sender = self.senders[index].clone();
         sender
     }
 
@@ -190,6 +184,7 @@ enum CountOperation {
     ReadValue(oneshot::Sender<(usize, usize)>),
 }
 
+#[derive(Debug)]
 enum WorkerOperation {
     Increment,
     ReadValue(oneshot::Sender<usize>),
@@ -207,7 +202,7 @@ struct CountWorker {
     index: usize,
     tx: mpsc::Sender<WorkerOperation>,
     rx: mpsc::Receiver<WorkerOperation>,
-    senders: Arc<tokio::sync::Mutex<Vec<mpsc::Sender<WorkerOperation>>>>,
+    senders: Vec<mpsc::Sender<WorkerOperation>>,
 }
 
 impl CountWorker {
@@ -218,12 +213,12 @@ impl CountWorker {
             index,
             tx,
             rx,
-            senders: Arc::new(tokio::sync::Mutex::new(vec![])),
+            senders: vec![],
         }
     }
 
     async fn register_worker(&mut self, tx: mpsc::Sender<WorkerOperation>) {
-        self.senders.lock().await.push(tx);
+        self.senders.push(tx);
     }
 
     async fn start_worker(&mut self) {
@@ -232,9 +227,10 @@ impl CountWorker {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                for tx in senders.lock().await.clone().iter() {
+                for tx in senders.iter() {
                     let merge = WorkerOperation::Merge(values.read().unwrap().clone());
-                    tx.send(merge).await;
+                    tracing::debug!("State: {:?}", merge);
+                    tx.send(merge).await.unwrap();
                 }
             }
         });
