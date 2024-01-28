@@ -1,7 +1,7 @@
 mod crdt;
 mod handler;
 
-use std::{collections::HashSet, hash::Hash};
+use std::collections::HashSet;
 
 use axum::{
     extract::State,
@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 
-use crdt::{StateCRDT, TwoPSetOperation};
+use crdt::{GCounter, StateCRDT, TwoPSetOperation};
 use handler::{CRDTHandler, HandlerOperation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -29,12 +29,12 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let size = 3;
-    let increment_tx = gcounter_init(size).await;
-    let max_tx = max_init(size).await;
-    let pncounter_tx = pncounter_init(size).await;
-    let gset_tx = gset_init(size).await;
-    let twopset_tx = twopset_init(size).await;
+    let size = 5;
+    let increment_tx = handler_init(size, |i, s| GCounter::new(i, s)).await;
+    let max_tx = handler_init(size, |_, _| crdt::Max::new()).await;
+    let pncounter_tx = handler_init(size, |i, s| crdt::PNCounter::new(i, s)).await;
+    let gset_tx = handler_init(size, |_, _| crdt::GSet::new()).await;
+    let twopset_tx = handler_init(size, |_, _| crdt::TwoPSet::new()).await;
 
     let app = Router::new()
         .route("/", get(root))
@@ -74,52 +74,19 @@ struct AppState {
     twopset_tx: mpsc::Sender<HandlerOperation<HashSet<i32>, TwoPSetOperation<i32>>>,
 }
 
-async fn gcounter_init(size: usize) -> Sender<HandlerOperation<usize, usize>> {
-    let count_state = (0..size - 1)
-        .into_iter()
-        .map(|index| crdt::GCounter::new(index, size))
-        .collect();
-    start_handler(count_state).await
-}
-
-async fn gset_init<T>(size: usize) -> Sender<HandlerOperation<HashSet<T>, T>>
+async fn handler_init<F, T, V, O>(size: usize, init_fn: F) -> Sender<HandlerOperation<V, O>>
 where
-    T: PartialEq + Eq + Hash + Send + Sync + Clone + 'static,
+    F: Fn(usize, usize) -> T,
+    T: StateCRDT<V, O> + 'static,
+    V: Send + Sync + 'static,
+    O: Send + Sync + 'static,
 {
-    let gset_state = (0..size - 1)
+    let state = (0..size - 1)
         .into_iter()
-        .map(|_| crdt::GSet::new())
+        .map(|index| init_fn(index, size))
         .collect();
-    start_handler(gset_state).await
+    start_handler(state).await
 }
-
-async fn twopset_init<T>(size: usize) -> Sender<HandlerOperation<HashSet<T>, TwoPSetOperation<T>>>
-where
-    T: PartialEq + Eq + Hash + Send + Sync + Clone + 'static,
-{
-    let twopset_state = (0..size - 1)
-        .into_iter()
-        .map(|_| crdt::TwoPSet::new())
-        .collect();
-    start_handler(twopset_state).await
-}
-
-async fn max_init(size: usize) -> Sender<HandlerOperation<u64, u64>> {
-    let max_state = (0..size - 1)
-        .into_iter()
-        .map(|_| crdt::Max::new())
-        .collect();
-    start_handler(max_state).await
-}
-
-async fn pncounter_init(size: usize) -> Sender<HandlerOperation<isize, isize>> {
-    let init_state = (0..size)
-        .into_iter()
-        .map(|index| crdt::PNCounter::new(index, size))
-        .collect();
-    start_handler(init_state).await
-}
-
 async fn start_handler<T, V, O>(init_state: Vec<T>) -> Sender<HandlerOperation<V, O>>
 where
     T: Send + Sync + StateCRDT<V, O> + 'static,
