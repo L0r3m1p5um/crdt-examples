@@ -1,5 +1,7 @@
-use std::sync::{Arc, RwLock};
-use std::{cmp::max, time::Duration};
+mod crdt;
+mod handler;
+
+use std::{collections::HashSet, hash::Hash};
 
 use axum::{
     extract::State,
@@ -8,12 +10,13 @@ use axum::{
     Json, Router,
 };
 
-use serde::Serialize;
+use crdt::{StateCRDT, TwoPSetOperation};
+use handler::{CRDTHandler, HandlerOperation};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{
     mpsc::{self, Sender},
     oneshot,
 };
-use tokio::time::Instant;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -26,18 +29,33 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let mut handler = CountHandler::new(3);
-    let tx = handler.sender();
-
-    tokio::spawn(async move {
-        handler.start_process().await;
-    });
+    let size = 3;
+    let increment_tx = gcounter_init(size).await;
+    let max_tx = max_init(size).await;
+    let pncounter_tx = pncounter_init(size).await;
+    let gset_tx = gset_init(size).await;
+    let twopset_tx = twopset_init(size).await;
 
     let app = Router::new()
         .route("/", get(root))
         .route("/increment", post(increment))
         .route("/count", get(read_count))
-        .with_state(IncrementState { tx: tx });
+        .route("/max", post(set_max))
+        .route("/max", get(get_max))
+        .route("/pncounter", post(update_pncounter))
+        .route("/pncounter", get(read_pncounter))
+        .route("/gset", post(update_gset))
+        .route("/gset", get(read_gset))
+        .route("/twopset", get(read_twopset))
+        .route("/twopset/add", post(add_twopset))
+        .route("/twopset/remove", post(remove_twopset))
+        .with_state(AppState {
+            increment_tx,
+            max_tx,
+            pncounter_tx,
+            gset_tx,
+            twopset_tx,
+        });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -47,14 +65,173 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+#[derive(Clone)]
+struct AppState {
+    increment_tx: mpsc::Sender<HandlerOperation<usize, usize>>,
+    max_tx: mpsc::Sender<HandlerOperation<u64, u64>>,
+    pncounter_tx: mpsc::Sender<HandlerOperation<isize, isize>>,
+    gset_tx: mpsc::Sender<HandlerOperation<HashSet<String>, String>>,
+    twopset_tx: mpsc::Sender<HandlerOperation<HashSet<i32>, TwoPSetOperation<i32>>>,
+}
+
+async fn gcounter_init(size: usize) -> Sender<HandlerOperation<usize, usize>> {
+    let count_state = (0..size - 1)
+        .into_iter()
+        .map(|index| crdt::GCounter::new(index, size))
+        .collect();
+    start_handler(count_state).await
+}
+
+async fn gset_init<T>(size: usize) -> Sender<HandlerOperation<HashSet<T>, T>>
+where
+    T: PartialEq + Eq + Hash + Send + Sync + Clone + 'static,
+{
+    let gset_state = (0..size - 1)
+        .into_iter()
+        .map(|_| crdt::GSet::new())
+        .collect();
+    start_handler(gset_state).await
+}
+
+async fn twopset_init<T>(size: usize) -> Sender<HandlerOperation<HashSet<T>, TwoPSetOperation<T>>>
+where
+    T: PartialEq + Eq + Hash + Send + Sync + Clone + 'static,
+{
+    let twopset_state = (0..size - 1)
+        .into_iter()
+        .map(|_| crdt::TwoPSet::new())
+        .collect();
+    start_handler(twopset_state).await
+}
+
+async fn max_init(size: usize) -> Sender<HandlerOperation<u64, u64>> {
+    let max_state = (0..size - 1)
+        .into_iter()
+        .map(|_| crdt::Max::new())
+        .collect();
+    start_handler(max_state).await
+}
+
+async fn pncounter_init(size: usize) -> Sender<HandlerOperation<isize, isize>> {
+    let init_state = (0..size)
+        .into_iter()
+        .map(|index| crdt::PNCounter::new(index, size))
+        .collect();
+    start_handler(init_state).await
+}
+
+async fn start_handler<T, V, O>(init_state: Vec<T>) -> Sender<HandlerOperation<V, O>>
+where
+    T: Send + Sync + StateCRDT<V, O> + 'static,
+    V: Send + Sync + 'static,
+    O: Send + Sync + 'static,
+{
+    let mut handler = CRDTHandler::new(init_state);
+    let tx = handler.sender();
+    tokio::spawn(async move {
+        handler.start_process().await;
+    });
+    tx
+}
+
 async fn root() -> &'static str {
     "Hello, World!"
 }
 
-async fn increment(State(state): State<IncrementState>) -> StatusCode {
-    let start = Instant::now();
-    let result = state.tx.send(CountOperation::Increment).await;
-    tracing::debug!("Elapsed: {}", start.elapsed().as_nanos());
+#[derive(Serialize, Deserialize)]
+struct MaxValue {
+    value: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ValueResponse<T> {
+    value: T,
+}
+
+async fn set_max(State(state): State<AppState>, Json(req): Json<MaxValue>) -> StatusCode {
+    send_update(&state.max_tx, req.value).await
+}
+
+async fn get_max(State(state): State<AppState>) -> Result<Json<ValueResponse<u64>>, StatusCode> {
+    send_read(&state.max_tx).await
+}
+
+async fn update_pncounter(
+    State(state): State<AppState>,
+    Json(req): Json<ValueResponse<isize>>,
+) -> StatusCode {
+    send_update(&state.pncounter_tx, req.value).await
+}
+
+async fn read_pncounter(
+    State(state): State<AppState>,
+) -> Result<Json<ValueResponse<isize>>, StatusCode> {
+    send_read(&state.pncounter_tx).await
+}
+
+async fn update_gset(
+    State(state): State<AppState>,
+    Json(req): Json<ValueResponse<String>>,
+) -> StatusCode {
+    send_update(&state.gset_tx, req.value).await
+}
+
+async fn read_gset(
+    State(state): State<AppState>,
+) -> Result<Json<ValueResponse<HashSet<String>>>, StatusCode> {
+    send_read(&state.gset_tx).await
+}
+
+async fn add_twopset(
+    State(state): State<AppState>,
+    Json(req): Json<ValueResponse<i32>>,
+) -> StatusCode {
+    send_update(&state.twopset_tx, TwoPSetOperation::Add(req.value)).await
+}
+
+async fn remove_twopset(
+    State(state): State<AppState>,
+    Json(req): Json<ValueResponse<i32>>,
+) -> StatusCode {
+    send_update(&state.twopset_tx, TwoPSetOperation::Remove(req.value)).await
+}
+
+async fn read_twopset(
+    State(state): State<AppState>,
+) -> Result<Json<ValueResponse<HashSet<i32>>>, StatusCode> {
+    send_read(&state.twopset_tx).await
+}
+
+async fn increment(State(state): State<AppState>) -> StatusCode {
+    send_update(&state.increment_tx, 1).await
+}
+
+async fn read_count(
+    State(state): State<AppState>,
+) -> Result<Json<ValueResponse<usize>>, StatusCode> {
+    send_read(&state.increment_tx).await
+}
+
+async fn send_read<V, O>(
+    tx: &Sender<HandlerOperation<V, O>>,
+) -> Result<Json<ValueResponse<V>>, StatusCode> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let _ = tx
+        .send(HandlerOperation::ReadValue(resp_tx))
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let value = resp_rx.await.map_err(|e| {
+        tracing::error!("Couldn't receive value: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(ValueResponse { value }))
+}
+
+async fn send_update<V, O>(tx: &Sender<HandlerOperation<V, O>>, op: O) -> StatusCode {
+    let result = tx.send(HandlerOperation::Update(op)).await;
     match result {
         Ok(_) => StatusCode::OK,
         Err(e) => {
@@ -64,234 +241,14 @@ async fn increment(State(state): State<IncrementState>) -> StatusCode {
     }
 }
 
-async fn read_count(
-    State(state): State<IncrementState>,
-) -> Result<Json<CountResponse>, StatusCode> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .tx
-        .send(CountOperation::ReadValue(tx))
-        .await
-        .map_err(|e| {
-            tracing::error!("Couldn't send tx: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let (count, gcount) = rx.await.map_err(|e| {
-        tracing::error!("Couldn't read count: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(CountResponse { count, gcount }))
-}
-
 #[derive(Serialize)]
 struct Response {
     message: &'static str,
 }
 
-#[derive(Clone)]
-struct IncrementState {
-    tx: mpsc::Sender<CountOperation>,
-}
-
-struct CountHandler {
-    tx: mpsc::Sender<CountOperation>,
-    rx: mpsc::Receiver<CountOperation>,
-    count: usize,
-    workers: usize,
-    senders: Vec<mpsc::Sender<WorkerOperation>>,
-}
-
-impl CountHandler {
-    fn new(workers: usize) -> Self {
-        let (tx, rx) = mpsc::channel(512);
-        Self {
-            count: 0,
-            tx,
-            rx,
-            workers,
-            senders: vec![],
-        }
-    }
-
-    fn sender(&self) -> Sender<CountOperation> {
-        self.tx.clone()
-    }
-
-    fn increment(&mut self) {
-        self.count += 1;
-    }
-
-    async fn start_process(&mut self) {
-        let mut workers: Vec<CountWorker> = (0..self.workers)
-            .into_iter()
-            .map(|index| CountWorker::new(self.workers, index))
-            .collect();
-        self.senders = workers.iter().map(|worker| worker.sender()).collect();
-        for sender in &self.senders {
-            for worker in &mut workers {
-                worker.register_worker(sender.clone()).await
-            }
-        }
-
-        workers.into_iter().for_each(|mut worker| {
-            tokio::spawn(async move {
-                worker.start_worker().await;
-            });
-        });
-
-        while let Some(op) = self.rx.recv().await {
-            match self.handle_operation(op).await {
-                _ => (),
-            }
-        }
-    }
-
-    fn get_sender(&mut self) -> Sender<WorkerOperation> {
-        let index = fastrand::usize(0..self.senders.len());
-        let sender = self.senders[index].clone();
-        sender
-    }
-
-    async fn handle_operation(&mut self, op: CountOperation) -> Result<(), ()> {
-        match op {
-            CountOperation::Increment => {
-                self.get_sender()
-                    .send(WorkerOperation::Increment)
-                    .await
-                    .unwrap();
-                Ok(self.increment())
-            }
-            CountOperation::ReadValue(rx) => {
-                let (wtx, wrx) = oneshot::channel();
-                self.get_sender()
-                    .send(WorkerOperation::ReadValue(wtx))
-                    .await
-                    .unwrap();
-                let gcount = wrx.await.map_err(|_| ())?;
-                let result = rx.send((self.count, gcount));
-                if result.is_err() {
-                    tracing::error!("Could not send back count value");
-                }
-                result.map_err(|_| ())?;
-                Ok(())
-            }
-        }
-    }
-}
-
-enum CountOperation {
-    Increment,
-    ReadValue(oneshot::Sender<(usize, usize)>),
-}
-
-#[derive(Debug)]
-enum WorkerOperation {
-    Increment,
-    ReadValue(oneshot::Sender<usize>),
-    Merge(Vec<usize>),
-}
-
 #[derive(Serialize)]
 struct CountResponse {
     count: usize,
-    gcount: usize,
 }
-
-struct CountWorker {
-    values: Arc<RwLock<Vec<usize>>>,
-    index: usize,
-    tx: mpsc::Sender<WorkerOperation>,
-    rx: mpsc::Receiver<WorkerOperation>,
-    senders: Vec<mpsc::Sender<WorkerOperation>>,
-}
-
-impl CountWorker {
-    fn new(size: usize, index: usize) -> Self {
-        let (tx, rx) = mpsc::channel(512);
-        CountWorker {
-            values: Arc::new(RwLock::new(vec![0; size])),
-            index,
-            tx,
-            rx,
-            senders: vec![],
-        }
-    }
-
-    async fn register_worker(&mut self, tx: mpsc::Sender<WorkerOperation>) {
-        self.senders.push(tx);
-    }
-
-    async fn start_worker(&mut self) {
-        let senders = self.senders.clone();
-        let values = self.values.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                for tx in senders.iter() {
-                    let merge = WorkerOperation::Merge(values.read().unwrap().clone());
-                    tracing::debug!("State: {:?}", merge);
-                    tx.send(merge).await.unwrap();
-                }
-            }
-        });
-        while let Some(op) = self.rx.recv().await {
-            match self.handle_operation(op) {
-                _ => (),
-            }
-        }
-    }
-
-    fn value(&self) -> usize {
-        self.values.read().unwrap().iter().sum()
-    }
-
-    fn sender(&self) -> mpsc::Sender<WorkerOperation> {
-        self.tx.clone()
-    }
-
-    fn increment(&mut self) {
-        self.values.write().unwrap()[self.index] += 1;
-    }
-
-    fn merge(&mut self, vals: Vec<usize>) {
-        let new_values: Vec<usize> = self
-            .values
-            .read()
-            .unwrap()
-            .iter()
-            .zip(vals)
-            .map(|(first, second)| max(*first, second))
-            .collect();
-        let mut lock = self.values.write().unwrap();
-        *lock = new_values;
-    }
-
-    fn handle_operation(&mut self, op: WorkerOperation) -> Result<(), usize> {
-        match op {
-            WorkerOperation::Increment => Ok(self.increment()),
-            WorkerOperation::ReadValue(tx) => tx.send(self.value()),
-            WorkerOperation::Merge(vals) => Ok(self.merge(vals)),
-        }
-    }
-}
-
 #[cfg(test)]
-mod test {
-    use crate::CountWorker;
-
-    #[test]
-    fn increment_worker() {
-        let mut worker = CountWorker::new(3, 1);
-        *worker.values.write().unwrap() = vec![1, 0, 3];
-        worker.increment();
-        assert!(*worker.values.read().unwrap() == vec![1, 1, 3]);
-    }
-
-    #[test]
-    fn merge_worker() {
-        let mut worker = CountWorker::new(3, 1);
-        *worker.values.write().unwrap() = vec![0, 1, 3];
-        worker.merge(vec![2, 1, 2]);
-        assert!(*worker.values.read().unwrap() == vec![2, 1, 3]);
-    }
-}
+mod test {}
